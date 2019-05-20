@@ -1,7 +1,35 @@
-## 3.1.2 [unreleased]
+## 4.0.1 [unreleased]
 
+- Made type optional for custom mapping for Elasticsearch 6
+- Fixed error when suggestions empty
+- Fixed `models` option with inheritance
+
+## 4.0.0
+
+- Added support for Elasticsearch 7
+- Added `models` option
+
+Breaking changes
+
+- Removed support for Elasticsearch 5
+- Removed support for multi-word synonyms (they no longer work with shingles)
+
+## 3.1.3
+
+- Added support for endless ranges
+- Added support for routing to `similar` method
+- Added `prefix` to `where`
+- Fixed error with elasticsearch-ruby 6.3
+- Fixed error with some language stemmers and Elasticsearch 6.5
+- Fixed issue with misspellings below and body block
+
+## 3.1.2
+
+- Improved performance of indices boost
 - Fixed deletes with routing and `async` callbacks
 - Fixed deletes with routing and `queue` callbacks
+- Fixed deprecation warnings
+- Fixed field misspellings for older partial match format
 
 ## 3.1.1
 

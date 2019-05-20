@@ -15,10 +15,10 @@ module Searchkick
       :out_of_range?, :hits, :response, :to_a, :first
 
     def initialize(klass, term = "*", **options)
-      unknown_keywords = options.keys - [:aggs, :body, :body_options, :boost,
+      unknown_keywords = options.keys - [:aggs, :block, :body, :body_options, :boost,
         :boost_by, :boost_by_distance, :boost_by_recency, :boost_where, :conversions, :conversions_term, :debug, :emoji, :exclude, :execute, :explain,
         :fields, :highlight, :includes, :index_name, :indices_boost, :limit, :load,
-        :match, :misspellings, :model_includes, :offset, :operator, :order, :padding, :page, :per_page, :profile,
+        :match, :misspellings, :models, :model_includes, :offset, :operator, :order, :padding, :page, :per_page, :profile,
         :request_params, :routing, :scope_results, :select, :similar, :smart_aggs, :suggest, :total_entries, :track, :type, :where]
       raise ArgumentError, "unknown keywords: #{unknown_keywords.join(", ")}" if unknown_keywords.any?
 
@@ -39,6 +39,7 @@ module Searchkick
       @misspellings = false
       @misspellings_below = nil
       @highlighted_fields = nil
+      @index_mapping = nil
 
       prepare
     end
@@ -56,9 +57,19 @@ module Searchkick
     end
 
     def params
+      if options[:models]
+        @index_mapping = {}
+        Array(options[:models]).each do |model|
+          # there can be multiple models per index name due to inheritance - see #1259
+          (@index_mapping[model.searchkick_index.name] ||= []) << model
+        end
+      end
+
       index =
         if options[:index_name]
           Array(options[:index_name]).map { |v| v.respond_to?(:searchkick_index) ? v.searchkick_index.name : v }.join(",")
+        elsif options[:models]
+          @index_mapping.keys.join(",")
         elsif searchkick_index
           searchkick_index.name
         else
@@ -116,8 +127,9 @@ module Searchkick
         misspellings: @misspellings,
         term: term,
         scope_results: options[:scope_results],
-        index_name: options[:index_name],
-        total_entries: options[:total_entries]
+        total_entries: options[:total_entries],
+        index_mapping: @index_mapping,
+        suggest: options[:suggest]
       }
 
       if options[:debug]
@@ -166,7 +178,7 @@ module Searchkick
     end
 
     def retry_misspellings?(response)
-      @misspellings_below && response["hits"]["total"] < @misspellings_below
+      @misspellings_below && Searchkick::Results.new(searchkick_klass, response).total_count < @misspellings_below
     end
 
     private
@@ -281,10 +293,10 @@ module Searchkick
             prefix_length = (misspellings.is_a?(Hash) && misspellings[:prefix_length]) || 0
             default_max_expansions = @misspellings_below ? 20 : 3
             max_expansions = (misspellings.is_a?(Hash) && misspellings[:max_expansions]) || default_max_expansions
-            misspellings_fields = misspellings.is_a?(Hash) && misspellings.key?(:fields) && misspellings[:fields].map { |f| "#{f}.#{@match_suffix}" }
+            misspellings_fields = misspellings.is_a?(Hash) && misspellings.key?(:fields) && misspellings[:fields].map(&:to_s)
 
             if misspellings_fields
-              missing_fields = misspellings_fields - fields
+              missing_fields = misspellings_fields - fields.map { |f| base_field(f) }
               if missing_fields.any?
                 raise ArgumentError, "All fields in per-field misspellings must also be specified in fields option"
               end
@@ -324,7 +336,7 @@ module Searchkick
             exclude_analyzer = nil
             exclude_field = field
 
-            field_misspellings = misspellings && (!misspellings_fields || misspellings_fields.include?(field))
+            field_misspellings = misspellings && (!misspellings_fields || misspellings_fields.include?(base_field(field)))
 
             if field == "_all" || field.end_with?(".analyzed")
               shared_options[:cutoff_frequency] = 0.001 unless operator.to_s == "and" || field_misspellings == false
@@ -377,7 +389,7 @@ module Searchkick
               queries_to_add.concat(q2)
             end
 
-            queries.concat(queries_to_add)
+            queries << queries_to_add
 
             if options[:exclude]
               must_not.concat(set_exclude(exclude_field, exclude_analyzer))
@@ -392,9 +404,10 @@ module Searchkick
 
             should = []
           else
+            # higher score for matching more fields
             payload = {
-              dis_max: {
-                queries: queries
+              bool: {
+                should: queries.map { |qs| {dis_max: {queries: qs}} }
               }
             }
 
@@ -410,6 +423,21 @@ module Searchkick
         where = (options[:where] || {}).dup
         if searchkick_options[:inheritance] && (options[:type] || (klass != searchkick_klass && searchkick_index))
           where[:type] = [options[:type] || klass].flatten.map { |v| searchkick_index.klass_document_type(v, true) }
+        end
+
+        models = Array(options[:models])
+        if models.any? { |m| m != m.searchkick_klass }
+          warn "[searchkick] WARNING: Passing child models to models option throws off hits and pagination - use type option instead"
+
+          # uncomment once aliases are supported with _index
+          # index_type_or =
+          #   models.map do |m|
+          #     v = {_index: m.searchkick_index.name}
+          #     v[:type] = m.searchkick_index.klass_document_type(m, true) if m != m.searchkick_klass
+          #     v
+          #   end
+
+          # where[:or] = Array(where[:or]) + [index_type_or]
         end
 
         # start everything as efficient filters
@@ -482,6 +510,9 @@ module Searchkick
 
       # merge more body options
       payload = payload.deep_merge(options[:body_options]) if options[:body_options]
+
+      # run block
+      options[:block].call(payload) if options[:block]
 
       @body = payload
       @page = page
@@ -660,11 +691,9 @@ module Searchkick
     def set_boost_by_indices(payload)
       return unless options[:indices_boost]
 
-      indices_boost = options[:indices_boost].each_with_object({}) do |(key, boost), memo|
+      indices_boost = options[:indices_boost].map do |key, boost|
         index = key.respond_to?(:searchkick_index) ? key.searchkick_index.name : key
-        # try to use index explicitly instead of alias: https://github.com/elasticsearch/elasticsearch/issues/4756
-        index_by_alias = Searchkick.client.indices.get_alias(index: index).keys.first
-        memo[index_by_alias || index] = boost
+        {index => boost}
       end
 
       payload[:indices_boost] = indices_boost
@@ -701,7 +730,7 @@ module Searchkick
     def set_highlights(payload, fields)
       payload[:highlight] = {
         fields: Hash[fields.map { |f| [f, {}] }],
-        fragment_size: below60? ? 30000 : 0
+        fragment_size: 0
       }
 
       if options[:highlight].is_a?(Hash)
@@ -812,7 +841,7 @@ module Searchkick
     # TODO id transformation for arrays
     def set_order(payload)
       order = options[:order].is_a?(Enumerable) ? options[:order] : {options[:order] => :asc}
-      id_field = :_uid
+      id_field = :_id
       payload[:sort] = order.is_a?(Array) ? order : Hash[order.map { |k, v| [k.to_s == "id" ? id_field : k, v] }]
     end
 
@@ -834,7 +863,12 @@ module Searchkick
         else
           # expand ranges
           if value.is_a?(Range)
-            value = {gte: value.first, (value.exclude_end? ? :lt : :lte) => value.last}
+            # infinite? added in Ruby 2.4
+            if value.end.nil? || (value.end.respond_to?(:infinite?) && value.end.infinite?)
+              value = {gte: value.first}
+            else
+              value = {gte: value.first, (value.exclude_end? ? :lt : :lte) => value.last}
+            end
           end
 
           value = {in: value} if value.is_a?(Array)
@@ -901,6 +935,8 @@ module Searchkick
                     }
                   }
                 }
+              when :prefix
+                filters << {prefix: {field => op_value}}
               when :regexp # support for regexp queries without using a regexp ruby object
                 filters << {regexp: {field => {value: op_value}}}
               when :not, :_not # not equal
@@ -1013,12 +1049,16 @@ module Searchkick
       end
     end
 
-    def below60?
-      Searchkick.server_below?("6.0.0")
+    def base_field(k)
+      k.sub(/\.(analyzed|word_start|word_middle|word_end|text_start|text_middle|text_end|exact)\z/, "")
     end
 
     def below61?
       Searchkick.server_below?("6.1.0")
+    end
+
+    def below70?
+      Searchkick.server_below?("7.0.0")
     end
   end
 end
